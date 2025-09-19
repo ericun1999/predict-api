@@ -9,13 +9,17 @@ import logging
 import psutil
 import time
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging for Heroku
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Set device (Render is CPU-only)
+# Set device (Heroku is CPU-only)
 device = torch.device("cpu")
 logger.info(f"Using device: {device}")
 
@@ -38,13 +42,12 @@ class_names = ['damaged', 'undamaged']
 # Load ResNet18 model
 def load_model(model_path):
     try:
-        model = models.resnet18(pretrained=False)  # No pretrained weights
+        model = models.resnet18(pretrained=False)
         num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, 2)  # Binary classification: damaged, undamaged
+        model.fc = nn.Linear(num_ftrs, 2)
         model.load_state_dict(torch.load(model_path, map_location=device))
         model = model.to(device)
         model.eval()
-        # Optional: Quantize model to reduce memory footprint
         model = torch.quantization.quantize_dynamic(model, {nn.Linear, nn.Conv2d}, dtype=torch.qint8)
         logger.info("Model loaded successfully")
         log_memory_usage()
@@ -57,7 +60,6 @@ def load_model(model_path):
 def predict_image(image_bytes):
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        # Pre-resize large images to reduce memory/CPU usage
         if image.size[0] > 1000 or image.size[1] > 1000:
             image = image.resize((1000, 1000))
         image = transform(image).unsqueeze(0).to(device)
@@ -72,20 +74,21 @@ def predict_image(image_bytes):
         logger.error(f"Error during prediction: {str(e)}")
         raise
 
-# Load model at startup
-model_path = 'best_model.pth'  # Ensure this file exists in your Render environment
-try:
-    model = load_model(model_path)
-except Exception as e:
-    logger.critical(f"Model loading failed, exiting: {str(e)}")
-    exit(1)
+# Lazy-load model
+model = None
+def load_model_if_needed():
+    global model
+    if model is None:
+        model_path = 'best_model.pth'
+        model = load_model(model_path)
+    return model
 
-# Root endpoint for health checks or basic info
+# Root endpoint
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({'status': 'API is running', 'endpoint': '/predict for POST requests'})
 
-# Health check endpoint for Render
+# Health check endpoint
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'healthy'})
@@ -105,23 +108,29 @@ def predict():
         logger.error("No file selected")
         return jsonify({'error': 'No file selected'}), 400
     
-    if file:
-        try:
-            img_bytes = file.read()
-            log_memory_usage()  # Log memory before prediction
-            prediction, confidence = predict_image(img_bytes)
-            logger.info(f"Prediction completed in {time.time() - start_time:.2f} seconds")
-            log_memory_usage()  # Log memory after prediction
-            return jsonify({
-                'prediction': prediction,
-                'confidence': confidence
-            })
-        except Exception as e:
-            logger.error(f"Error during prediction: {str(e)}")
-            return jsonify({'error': str(e)}), 500
+    # Check file size (max 10 MB)
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    if file_size > 10 * 1024 * 1024:
+        logger.error("File too large")
+        return jsonify({'error': 'File too large, max 10 MB'}), 400
+    file.seek(0)
     
-    return jsonify({'error': 'Invalid file'}), 400
+    try:
+        img_bytes = file.read()
+        log_memory_usage()
+        load_model_if_needed()  # Lazy-load model
+        prediction, confidence = predict_image(img_bytes)
+        logger.info(f"Prediction completed in {time.time() - start_time:.2f} seconds")
+        log_memory_usage()
+        return jsonify({
+            'prediction': prediction,
+            'confidence': confidence
+        })
+    except Exception as e:
+        logger.error(f"Error during prediction: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # 强制使用8080端口，与Cloud Run要求一致
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
